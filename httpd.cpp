@@ -83,7 +83,7 @@ void* accept_request(void * from_client){
     if(strcasecmp(method, "GET") && strcasecmp(method, "POST")){//== 1 
         //  == 0 表示相同   左右！=0（get post方法都没重写）  才执行 下面
         //忽略大小写  比较字符串
-        unimplement(client);
+        unimplemented(client);
         return  nullptr;
     }
     int cgi = 0;//0 表示不执行cgi   1---表示执行cgi
@@ -179,40 +179,45 @@ void * accept_request(void * from_client){
     }
     method[i] = '\0';
     if(strcasecmp(method, "get") && strcasecmp(method, "post")){
-        //==1  &&什么时候 ==1 ---> 两边都非0--->既不是get  又不是post  
+        //==1  && 什么时候 ==1 ---> 两边都非0--->既不是get  又不是post  
         //即 未实现
-        unimplement();
+        unimplemented(client);
         return nullptr;
     }
 
-    int cgi = 0;//0---不需要解析   1——---需要解析
+    int cgi = 0;    //0---不需要解析   1——---需要解析
     if(strcasecmp(method, "post") == 0){
         cgi = 1;
     }
 
     //解析url
     i = 0;
-    while(isSpace(buf[j]) == true && j < sizeof(buf)){
+    while((isSpace(buf[j]) == true) && (j < sizeof(buf))){
         j++;
     }
-    while(isSpace(buf[j]) == false  && i < sizeof(url) -1 && j < sizeof(buf)){
+
+    while((isSpace(buf[j]) == false)  && (i < sizeof(url) -1) && (j < sizeof(buf))){
         url[i] = buf[j];
         i++;
         j++;
     }
     url[i] = '\0';
+
+
     char* query_string;
-    if(strncasecmp(method ,"get") == 0){
+    //GET请求url可能会带有?,有查询参数
+    if(strcasecmp(method ,"get") == 0){
         //get 方法有参数
         query_string = url;
         while((*query_string != '?') && (*query_string != '\0')){
             query_string++;
         }
+
         //是?
         if(*query_string == '?'){
-            cgi = 1;
-            *query_string = '\0';
-            query_string++;
+            cgi = 1 ;
+            *query_string = '\0' ;
+            query_string++ ;
         }
     }
     sprintf(path, "httpdoc%s" , url);
@@ -253,6 +258,170 @@ void * accept_request(void * from_client){
     return nullptr;
 }
 
+
+//如果不是cgi文件，也就是静态文件，直接读取文件返回给请求的http客户端即可
+void serve_file(int client, const char *filename){
+    FILE* resource = NULL;
+    int numchars = 1;
+    char buf[1024];
+    buf[0] = 'A';
+    buf[1] = '\0';
+    
+    while((numchars > 0) && strcmp("\n", buf)){
+        numchars = get_line(client, buf, sizeof(buf));
+    }
+
+    //打开文件
+    resource = fopen(filename, "r");
+    if(resource == NULL){
+        not_found(client);
+    }else{
+        headers(client, filename);
+        cat(client, resource);
+    }
+    fclose(resource);//关闭文件句柄
+}
+
+void cat(int client, FILE* resource){
+    //发送文件的内容
+    char buf[1024];
+    fgets(buf, sizeof(buf), resource);
+    while(!feof(resource)){
+        send(client, buf, strlen(buf), 0);
+        fgets(buf, sizeof(buf), resource);
+    }
+}
+
+void execute_cgi(int client, const char * path, const char* method, const char *  query_string){
+    char buf[1024];
+    buf[0] = 'A';//默认字符
+    buf[1] = '\0';
+    int numchars = 1;
+    int content_length = -1;
+    if (strcasecmp(method, "get") == 0)
+    {
+       //get
+       //读取数据，把整个header都读掉，因为get写死了，直接读取html
+       while((numchars > 0) && strcmp("\n", buf)){//buf！=\n
+           numchars = get_line(client, buf,sizeof(buf));
+       }
+    }else if(strcasecmp(method, "post") == 0){
+        //post  需要contentlength
+        //先读一行
+        numchars = get_line(client, buf, sizeof(buf));
+        while(numchars > 0  && strcmp("\n", buf))
+        {
+            //如果是post请求， 就需要得到contentlength  
+            //contentlength这个字符串一共长为15位，所以
+            //去处头部依据后，将16位设置为结束符，进行比较
+            //第16位为结束
+            buf[15] = '\0';
+            if(strcasecmp(buf, "Content-Length:") == 0){
+                //内存从第17位开始就是长度，将17位开始的所有字符串转成整数就是content_length
+                content_length = atoi(&(buf[16]));
+            }
+            numchars = get_line(client, buf, sizeof(buf));
+        }
+
+        if(content_length == -1){
+            bad_request(client);
+            return;
+        }
+    }else{
+        // header or other
+    }
+
+    sprintf(buf, "HTTP/1.0 200 OK\r\n");
+    send(client, buf, strlen(buf) , 0);
+
+    //2根管道
+    int cgi_output[2];
+    int cgi_input[2];
+
+    //建立output管道
+    if(pipe(cgi_output) < 0){
+        cannot_execute(client);
+        return;
+    }
+
+    //建立input管道
+    if(pipe(cgi_input) < 0){
+        cannot_execute(client);
+        return;
+    }
+
+    pid_t pid;
+    if((pid = fork()) < 0){
+        cannot_execute(client);
+        return;
+    }
+
+
+    int i;
+    char c;
+    int status;
+    if( pid == 0 ){//子进程
+        //子进程：运行cgi脚本
+        char meth_env[255];
+        char query_env[255];
+        char length_env[255];
+
+        // fork后管道都复制了一份，都是一样的
+        // 子进程关闭2个无用的端口，避免浪费
+        // x<---------------->1    output
+        // 0<---------------->x    input
+
+        //子进程输出重定向到output管道的1端
+        dup2(cgi_output[1], 1);
+        //子进程输入重定向到input 管道的0端
+        dup2(cgi_input[0], 0);
+
+        //关闭无用管道口
+        close(cgi_output[0]);
+        close(cgi_input[1]);
+
+        //cgi环境变量
+        sprintf(meth_env, "REQUEST_METHOD=%s",method);
+        putenv(meth_env);
+        if(strcasecmp(method, "get") == 0){
+            sprintf(query_env , "QUERY_STRING=%s", query_string);
+            putenv(query_env);
+        }else{
+            //post
+            sprintf(length_env, "CONTENT_LENGTH=%d", content_length);
+            putenv(length_env);
+        }
+        //替换执行path
+        execl(path, NULL);
+        // int m = excel(path, path, NULL);
+        // 如果path有问题， 例如将html网页还在往里面写东西，
+        // 触发Program received signal SIGPIPE , Broken pipe.
+        exit(0);
+    }else{
+        //parent 
+        // 父进程关闭2个无用的端口，避免浪费
+        // 0<---------------->x    output
+        // x<---------------->1    input
+        //此时父子进程已经可以通信
+        close(cgi_output[1]);
+        close(cgi_input[0]);
+        if (strcasecmp(method, "POST") == 0){
+            for (i = 0; i < content_length; i++){
+                recv(client, &c, 1, 0);
+                write(cgi_input[1], &c, 1);
+            }
+        }
+        //从output管道读到子进程处理后的信息，然后send出去
+        while(read(cgi_output[0], &c, 1) > 0){
+            send(client, &c, 1, 0);
+        }
+        //完成操作后关闭管道
+        close(cgi_output[0]);
+        close(cgi_input[1]);
+        //等待子进程返回
+        waitpid(pid, &status, 0);
+    }
+}
 
 int main(){
     // //启动服务端   httpd = socket     
@@ -382,3 +551,93 @@ int startup(int& port){
     return httpd; /// 返回httpd
 }
 
+void cannot_execute(int client)
+{
+	 char buf[1024];
+	//发送500
+	 sprintf(buf, "HTTP/1.0 500 Internal Server Error\r\n");
+	 send(client, buf, strlen(buf), 0);
+	 sprintf(buf, "Content-type: text/html\r\n");
+	 send(client, buf, strlen(buf), 0);
+	 sprintf(buf, "\r\n");
+	 send(client, buf, strlen(buf), 0);
+	 sprintf(buf, "<P>Error prohibited CGI execution.\r\n");
+	 send(client, buf, strlen(buf), 0);
+}
+
+void bad_request(int client)
+{
+	 char buf[1024];
+	//发送400
+	 sprintf(buf, "HTTP/1.0 400 BAD REQUEST\r\n");
+	 send(client, buf, sizeof(buf), 0);
+	 sprintf(buf, "Content-type: text/html\r\n");
+	 send(client, buf, sizeof(buf), 0);
+	 sprintf(buf, "\r\n");
+	 send(client, buf, sizeof(buf), 0);
+	 sprintf(buf, "<P>Your browser sent a bad request, ");
+	 send(client, buf, sizeof(buf), 0);
+	 sprintf(buf, "such as a POST without a Content-Length.\r\n");
+	 send(client, buf, sizeof(buf), 0);
+}
+
+//返回404错误页面，组装信息
+void not_found(int client)
+{
+	 char buf[1024];
+	 sprintf(buf, "HTTP/1.0 404 NOT FOUND\r\n");
+	 send(client, buf, strlen(buf), 0);
+	 sprintf(buf, SERVER_STRING);
+	 send(client, buf, strlen(buf), 0);
+	 sprintf(buf, "Content-Type: text/html\r\n");
+	 send(client, buf, strlen(buf), 0);
+	 sprintf(buf, "\r\n");
+	 send(client, buf, strlen(buf), 0);
+	 sprintf(buf, "<HTML><TITLE>Not Found</TITLE>\r\n");
+	 send(client, buf, strlen(buf), 0);
+	 sprintf(buf, "<BODY><P>The server could not fulfill\r\n");
+	 send(client, buf, strlen(buf), 0);
+	 sprintf(buf, "your request because the resource specified\r\n");
+	 send(client, buf, strlen(buf), 0);
+	 sprintf(buf, "is unavailable or nonexistent.\r\n");
+	 send(client, buf, strlen(buf), 0);
+	 sprintf(buf, "</BODY></HTML>\r\n");
+	 send(client, buf, strlen(buf), 0);
+}
+
+void headers(int client, const char *filename)
+{
+	 char buf[1024];
+	 (void)filename;  /* could use filename to determine file type */
+	//发送HTTP头
+	 strcpy(buf, "HTTP/1.0 200 OK\r\n");
+	 send(client, buf, strlen(buf), 0);
+	 strcpy(buf, SERVER_STRING);
+	 send(client, buf, strlen(buf), 0);
+	 sprintf(buf, "Content-Type: text/html\r\n");
+	 send(client, buf, strlen(buf), 0);
+	 strcpy(buf, "\r\n");
+	 send(client, buf, strlen(buf), 0);
+}
+
+void unimplemented(int client)
+{
+	 char buf[1024];
+	//发送501说明相应方法没有实现
+	 sprintf(buf, "HTTP/1.0 501 Method Not Implemented\r\n");
+	 send(client, buf, strlen(buf), 0);
+	 sprintf(buf, SERVER_STRING);
+	 send(client, buf, strlen(buf), 0);
+	 sprintf(buf, "Content-Type: text/html\r\n");
+	 send(client, buf, strlen(buf), 0);
+	 sprintf(buf, "\r\n");
+	 send(client, buf, strlen(buf), 0);
+	 sprintf(buf, "<HTML><HEAD><TITLE>Method Not Implemented\r\n");
+	 send(client, buf, strlen(buf), 0);
+	 sprintf(buf, "</TITLE></HEAD>\r\n");
+	 send(client, buf, strlen(buf), 0);
+	 sprintf(buf, "<BODY><P>HTTP request method not supported.\r\n");
+	 send(client, buf, strlen(buf), 0);
+	 sprintf(buf, "</BODY></HTML>\r\n");
+	 send(client, buf, strlen(buf), 0);
+}
